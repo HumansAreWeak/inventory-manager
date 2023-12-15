@@ -11,4 +11,6 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+argon2 = { version = "0.5.2", features = ["std"] }
 clap = { version = "4.4.11", features = ["derive"] }
+rusqlite = { version = "0.30.0", features = ["bundled"] }
