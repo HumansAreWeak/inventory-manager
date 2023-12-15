@@ -1,6 +1,10 @@
 [package]
 name = "inventory-manager"
 authors = ["Maik Steiger <m.steiger@csurielektronics.com>"]
+license = "GPLv3"
+license-file="LICENSE"
+readme="README.md"
+description="Manage your inventory system in a homogenous way"
 version = "0.1.0"
 edition = "2021"
 
