@@ -8,3 +8,11 @@ target/
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+# Developer specific .env file
+# Mainly used for:
+# - SQLx checked queries
+.env
+
+# Main storage file for SQLite adapter
+storage
