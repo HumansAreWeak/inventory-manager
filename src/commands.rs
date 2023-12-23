@@ -1,12 +1,19 @@
-use crate::database::{AppConfig, InvManDBPool};
+use core::fmt;
+
+use crate::{
+    database::{AppConfig, InvManDBPool},
+    utils::{InvManSerialization, SchemaDeclarationVerify},
+    OutputType,
+};
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use serde::{Deserialize, Serialize};
+use serde::{de::IntoDeserializer, Deserialize, Serialize};
 
-pub struct CommandParams<'a> {
+pub struct CommandContext<'a> {
     pub db: &'a mut dyn InvManDBPool,
     pub config: &'a mut AppConfig,
     pub auth: Option<String>,
+    pub output: OutputType,
 }
 
 #[derive(Subcommand, Debug)]
@@ -32,9 +39,75 @@ pub enum ColumnType {
 pub enum ConfigCommands {}
 
 #[derive(Subcommand, Debug)]
-pub enum SchemeCommands {
-    Alter(SchemeAlterArgs),
+pub enum InventoryCommands {
+    /// Add an entity to your inventory
+    Add(InventoryAddArgs),
+
+    /// List all entities stored in your inventory
+    List(InventoryListArgs),
+
+    #[command(subcommand)]
+    /// Change the schema in which your entities are stored
+    Schema(InventorySchemaCommands),
 }
+
+#[derive(Subcommand, Debug)]
+pub enum InventorySchemaCommands {
+    /// Add or edit a schema column
+    Alter(SchemaAlterArgs),
+
+    /// Remove a schema column
+    Remove(SchemaRemoveArgs),
+
+    /// List your schema columns
+    List(NoParams),
+}
+
+#[derive(Args, Debug)]
+pub struct InventoryListArgs {
+    #[arg(short, long)]
+    /// Limit the amount of entities to be returned
+    limit: Option<i32>,
+
+    #[arg(short, long)]
+    /// How the returned rows should be sorted
+    sort: Vec<String>,
+
+    #[arg(short, long)]
+    /// How the returned rows should be sorted
+    condition: Vec<String>,
+}
+
+pub struct InventoryListProps {
+    pub limit: i32,
+}
+
+impl InventoryListArgs {
+    pub fn list(&self, context: &CommandContext) -> Result<String> {
+        let mut user = DBUser::new();
+        auth_valid(context, &mut user)?;
+        let props = InventoryListProps {
+            limit: self.limit.unwrap_or(-1),
+        };
+        let data = context.db.inventory_list(&props, &context.config)?;
+        return Ok(data.to_json());
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct InventoryAddArgs {
+    /// Enter your parameters according to your specified schema in a name=value way
+    params: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct SchemaRemoveArgs {
+    /// Name of the schema column
+    name: String,
+}
+
+#[derive(Args, Debug)]
+pub struct NoParams;
 
 #[derive(Args, Debug)]
 pub struct UserArgs {
@@ -51,7 +124,7 @@ pub struct UserEditArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct SchemeAlterArgs {
+pub struct SchemaAlterArgs {
     #[arg(short, long)]
     /// Specifies the name as tag for your column. Only following values are allowed [a-z\-\_] (Letters from a-z (lowercase), - (dash) and _ (underscore))
     name: String,
@@ -134,8 +207,20 @@ pub struct SchemaDeclaration {
     pub layout: String,
 }
 
+impl fmt::Display for ColumnType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ColumnType::BOOL => write!(f, "bool"),
+            ColumnType::INT => write!(f, "int"),
+            ColumnType::REAL => write!(f, "real"),
+            ColumnType::TEXT => write!(f, "text"),
+            ColumnType::VARCHAR => write!(f, "varchar"),
+        }
+    }
+}
+
 impl SchemaDeclaration {
-    fn new(args: &SchemeAlterArgs) -> Result<SchemaDeclaration> {
+    fn new(args: &SchemaAlterArgs) -> Result<SchemaDeclaration> {
         let name = args.name.clone();
         let default = args.default.clone();
         let hint = args.hint.clone();
@@ -182,22 +267,36 @@ impl SchemaDeclaration {
             bail!("Schema cannot have column type varchar with max-length being 0!");
         }
 
+        if decl.default != "NULL" {
+            if decl.max_length > 0 && decl.default.len() > usize::try_from(decl.max_length)? {
+                bail!("Schema default value cannot be longer than max-length!");
+            }
+            if decl.min_length > 0 && decl.default.len() < usize::try_from(decl.min_length)? {
+                bail!("Schema default value cannot be shorter than min-length!");
+            }
+        }
+
         return Ok(decl);
     }
 
     pub fn is_equal(&self, other: &SchemaDeclaration) -> bool {
         return self.name == other.name;
     }
+
+    pub fn to_json(&self) -> String {
+        return format!("{{\"name\":\"{}\",\"display_name\":\"{}\",\"unique\":{},\"max_length\":{},\"min_length\":{},\"max\":{},\"min\":{},\"nullable\":{},\"column_type\":\"{}\",\"default\":\"{}\",\"hint\":\"{}\",\"layout\":\"{}\"}}",
+                       self.name, self.display_name, self.unique, self.max_length, self.min_length, self.max, self.min, self.nullable, self.column_type, self.default, self.hint, self.layout);
+    }
 }
 
-fn auth_valid(auth: Option<String>, db: &dyn InvManDBPool, user: &mut DBUser) -> Result<bool> {
-    let auth = auth.unwrap_or("".into());
+fn auth_valid(context: &CommandContext, user: &mut DBUser) -> Result<bool> {
+    let auth = context.auth.clone().unwrap_or("".into());
     if auth.is_empty() {
         bail!("User authentication failure (No auth token was provided)");
     }
 
     return match auth.split_once(":") {
-        Some(s) => match db.user_auth(s.0, s.1, user) {
+        Some(s) => match context.db.user_auth(s.0, s.1, user) {
             Ok(_) => Ok(true),
             Err(e) => bail!("User authentication failure ({})", e.to_string()),
         },
@@ -206,44 +305,91 @@ fn auth_valid(auth: Option<String>, db: &dyn InvManDBPool, user: &mut DBUser) ->
 }
 
 impl UserArgs {
-    pub fn register(&self, param: &CommandParams) -> String {
+    pub fn register(&self, param: &mut CommandContext) -> Result<String> {
         if !param.config.allow_registration {
-            return "User registration failed (Registration is disabled by inventory administrator)"
-                .into();
+            bail!("User registration failed (Registration is disabled by inventory administrator)");
         }
 
         return match param
             .db
             .user_register(self.name.as_str(), self.password.as_str())
         {
-            Ok(s) => s,
-            Err(e) => format!("User registration failed ({})", e.to_string()),
+            Ok(s) => Ok(s),
+            Err(e) => bail!("User registration failed ({})", e.to_string()),
         };
     }
 }
 
 impl UserEditArgs {
-    pub fn edit(&self, param: &CommandParams) -> String {
+    pub fn edit(&self, context: &CommandContext) -> Result<String> {
         let mut user = DBUser::new();
-        return match auth_valid(param.auth.clone(), param.db, &mut user) {
-            Ok(_) => "Authentication succedded".into(),
-            Err(e) => e.to_string(),
-        };
+        auth_valid(context, &mut user)?;
+        return Ok("".into());
     }
 }
 
-impl SchemeAlterArgs {
-    pub fn alter(&self, param: &mut CommandParams) -> String {
+impl SchemaAlterArgs {
+    pub fn alter(&self, context: &mut CommandContext) -> Result<String> {
         let mut user = DBUser::new();
-        return match auth_valid(param.auth.clone(), param.db, &mut user) {
-            Ok(_) => match SchemaDeclaration::new(self) {
-                Ok(decl) => match param.db.schema_alter(param.config, decl) {
-                    Ok(_) => "Schema has been altered".into(),
-                    Err(e) => e.to_string(),
-                },
-                Err(e) => e.to_string(),
-            },
-            Err(e) => e.to_string(),
-        };
+        auth_valid(context, &mut user)?;
+        let decl = SchemaDeclaration::new(self)?;
+        return context.db.schema_alter(context.config, decl, &mut user);
+    }
+}
+
+impl NoParams {
+    pub fn schema_list(&self, context: &CommandContext) -> Result<String> {
+        let mut user = DBUser::new();
+        auth_valid(context, &mut user)?;
+        return Ok(context.config.inventory_schema_declaration.to_json());
+    }
+}
+
+impl SchemaRemoveArgs {
+    pub fn remove(&self, context: &mut CommandContext) -> Result<String> {
+        let mut user = DBUser::new();
+        auth_valid(context, &mut user)?;
+        return context
+            .db
+            .schema_remove(&mut context.config, self.name.as_str(), &user);
+    }
+}
+
+impl InventoryAddArgs {
+    pub fn add(&self, context: &mut CommandContext) -> Result<String> {
+        let mut user = DBUser::new();
+        auth_valid(context, &mut user)?;
+        let all_exist = self.params.iter().all(|e| match e.split_once("=") {
+            Some((name, _)) => context
+                .config
+                .inventory_schema_declaration
+                .iter()
+                .any(|e1| e1.name == name),
+            None => false,
+        });
+        if !all_exist {
+            bail!("One of the entered parameter did not match the schema");
+        }
+        let params: Vec<Result<(String, String)>> = self
+            .params
+            .iter()
+            .map(|e| e.check_against_declaration(&context.config.inventory_schema_declaration))
+            .collect();
+        let errors = params.iter().filter(|e| e.is_err());
+        if errors.clone().count() > 0 {
+            let return_message: Vec<String> = errors
+                .map(|e| {
+                    e.as_ref()
+                        .expect_err("Is Error flag is true but element is not of error type")
+                        .to_string()
+                })
+                .collect();
+            bail!("{}", return_message.join("\n"));
+        }
+        let params: Vec<(String, String)> = params
+            .iter()
+            .map(|e| e.as_ref().unwrap().to_owned())
+            .collect();
+        return context.db.inventory_add(&params, &context.config, &user);
     }
 }
