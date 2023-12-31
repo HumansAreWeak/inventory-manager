@@ -12,7 +12,7 @@ or `invman` as it is called as an executable, is a CLI tool for managing real-wo
   
 # Planned features
 
-- [ ] CRUD operations for inventory managment
+- [x] CRUD operations for inventory managment
 - [ ] Permissions model with roles (with a guest and a skipper (root) role)
 
 For any suggestions what could be implemented, open an issue or make a PR.
