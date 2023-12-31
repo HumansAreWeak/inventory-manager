@@ -54,7 +54,7 @@ fn main() {
     let mut conn = InvManConnection::sqlite().unwrap();
     let pool: &mut dyn InvManDBPool = &mut conn;
     let mut config = pool.get_config();
-    let mut params = CommandContext {
+    let mut ctx = CommandContext {
         db: pool,
         auth: cli.auth,
         config: &mut config,
@@ -63,19 +63,21 @@ fn main() {
 
     let response = match &cli.command {
         User(args) => match args {
-            UserCommands::Register(args) => args.register(&mut params),
-            UserCommands::Edit(args) => args.edit(&params),
+            UserCommands::Register(args) => args.register(&mut ctx),
+            UserCommands::Edit(args) => args.edit(&ctx),
         },
         Config(args) => match args {
             _ => Ok("not a command".into()),
         },
         Inventory(args) => match args {
-            InventoryCommands::Add(args) => args.add(&mut params),
-            InventoryCommands::List(args) => args.list(&params),
+            InventoryCommands::Add(args) => args.add(&mut ctx),
+            InventoryCommands::List(args) => args.list(&ctx),
+            InventoryCommands::Edit(args) => args.edit(&mut ctx),
+            InventoryCommands::Remove(args) => args.remove(&mut ctx),
             InventoryCommands::Schema(args) => match args {
-                InventorySchemaCommands::Alter(args) => args.alter(&mut params),
-                InventorySchemaCommands::List(args) => args.schema_list(&mut params),
-                InventorySchemaCommands::Remove(args) => args.remove(&mut params),
+                InventorySchemaCommands::Alter(args) => args.alter(&mut ctx),
+                InventorySchemaCommands::List(args) => args.schema_list(&mut ctx),
+                InventorySchemaCommands::Remove(args) => args.remove(&mut ctx),
             },
         },
     };

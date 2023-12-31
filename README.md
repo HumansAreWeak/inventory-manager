@@ -1,8 +1,6 @@
 # Inventory Manager
 
-or `invman` as it is called as an executable, is a CLI tool for managing real-world inventories with high-level syntax. It is written to be as precise and as comprehensible as possible, i.e. it is possible to view each state that your inventory has been at a particular point in time. 
-
-This tool is not yet production ready and is still in heavy development. 
+or `invman` as it is called as an executable, is a CLI tool for managing real-world inventories with declarative syntax. It is written to be as precise and as comprehensible as possible, i.e. it is possible to view each state that your inventory has been at any point in time. 
 
 # Features
 
@@ -60,3 +58,18 @@ Adds an entity to inventory. Takes in a list of `schema["name"]=value` pairs. It
 `inventory list <OPTIONS>`
 
 Lists all the items in the inventory. You can give it options to further define the output that you want to list.
+
+`Available Options:`
+- `--raw / -r <QUERY>`: Enter your raw SQL query that will be executed directly on the database provider. Beware of directly inserting values in the raw query, as this _WILL_ lead to SQL injection vulnerability. If you want to use parameters, use the `--param / -p` flag in the same order you want to process them on the driver for execution and use `?` for SQLite (optionally with numbers) to replace these fields with the provided values.
+
+By using the `--raw / -r` flag, only `--param / -p` is accepted, all other flags will be ignored
+
+- `--limit / -l <LIMIT>`: Limits the amount of items queried by the database.
+
+`inventory edit --identifier <ID> <OPTIONS>`
+
+Edits the underlying entity of given identifier with the provided option fields. Each option must be marked with `--set / -s` flag, followed by its schema column name, an equal sign and its value, i.e. `-s name=value` to change `name` to `value`.
+
+`inventory remove --identifier <ID>`
+
+Softly deletes the entity of given identifier. The field `deleted_at` is automatically set to mark the date of entity deletion. 

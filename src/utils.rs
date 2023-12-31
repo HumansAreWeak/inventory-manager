@@ -1,6 +1,6 @@
 use crate::{
     commands::{ColumnType, SchemaDeclaration},
-    database::JsonEntry,
+    database::{KeyValueCollection, KeyValueTypeEntry, SchemaCollection},
 };
 use anyhow::{anyhow, bail, Result};
 
@@ -99,7 +99,7 @@ pub trait InvManDbHelper {
     fn to_sql_names(&self) -> String;
 }
 
-impl InvManSerialization for Vec<JsonEntry> {
+impl InvManSerialization for Vec<KeyValueCollection> {
     fn to_json(&self) -> String {
         let mut jsons = self
             .iter()
@@ -131,5 +131,56 @@ impl InvManDbHelper for Vec<SchemaDeclaration> {
             .map(|e| e.name.to_owned())
             .collect::<Vec<String>>()
             .join(",")
+    }
+}
+
+pub trait InvManNotationHelper {
+    fn to_typed_key_value_entry(
+        &self,
+        declarations: &SchemaCollection,
+    ) -> Result<KeyValueTypeEntry>;
+}
+
+pub trait InvManNotationHelperVec {
+    fn to_key_value_collection(
+        &self,
+        declarations: &SchemaCollection,
+    ) -> Result<KeyValueCollection>;
+}
+
+impl InvManNotationHelperVec for Vec<String> {
+    fn to_key_value_collection(
+        &self,
+        declarations: &SchemaCollection,
+    ) -> Result<KeyValueCollection> {
+        return Ok(KeyValueCollection {
+            collection: self
+                .iter()
+                .map(|e| e.to_typed_key_value_entry(declarations))
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?,
+        });
+    }
+}
+
+impl InvManNotationHelper for String {
+    fn to_typed_key_value_entry(
+        &self,
+        declarations: &SchemaCollection,
+    ) -> Result<KeyValueTypeEntry> {
+        return match self.split_once("=") {
+            None => Err(anyhow!("Could not split parsed parameter")),
+            Some(val) => {
+                if let Some(decl) = declarations.collection.iter().find(|e| e.name == val.0) {
+                    Ok(KeyValueTypeEntry::new(
+                        val.0.to_string(),
+                        Some(val.1.to_string()),
+                        decl.column_type,
+                    ))
+                } else {
+                    Err(anyhow!("Could not find '{}' in table schema", val.0))
+                }
+            }
+        };
     }
 }

@@ -3,7 +3,7 @@ name = "invman"
 authors = ["Maik Steiger <m.steiger@csurielektronics.com>"]
 license = "GPLv3"
 readme="README.md"
-description="Manage your inventory system in a homogenous way"
+description="Manage your inventory declaratively"
 version = "0.1.0"
 edition = "2021"
 

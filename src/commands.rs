@@ -1,19 +1,36 @@
-use core::fmt;
-
 use crate::{
-    database::{AppConfig, InvManDBPool},
-    utils::{InvManSerialization, SchemaDeclarationVerify},
+    database::{AppConfig, InvManDBPool, KeyValueCollection},
+    utils::{InvManNotationHelper, InvManNotationHelperVec, InvManSerialization},
     OutputType,
 };
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use serde::{de::IntoDeserializer, Deserialize, Serialize};
+use core::fmt;
+use serde::{Deserialize, Serialize};
 
 pub struct CommandContext<'a> {
     pub db: &'a mut dyn InvManDBPool,
     pub config: &'a mut AppConfig,
     pub auth: Option<String>,
     pub output: OutputType,
+}
+
+impl<'a> CommandContext<'a> {
+    fn authenticate(&self) -> Result<DBUser> {
+        let auth = self.auth.clone().unwrap_or("".into());
+        if auth.is_empty() {
+            bail!("User authentication failure (No auth token was provided)");
+        }
+        let mut user = DBUser::new();
+
+        return match auth.split_once(":") {
+            Some(s) => match self.db.user_auth(s.0, s.1, &mut user) {
+                Ok(_) => Ok(user),
+                Err(e) => bail!("User authentication failure ({})", e.to_string()),
+            },
+            None => bail!("User authentication failure (Failed to split the token)"),
+        };
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -49,6 +66,52 @@ pub enum InventoryCommands {
     #[command(subcommand)]
     /// Change the schema in which your entities are stored
     Schema(InventorySchemaCommands),
+
+    /// Edit an existing entity in your inventory
+    Edit(InventoryEditArgs),
+
+    /// Remove an entity from your inventory
+    Remove(InventoryRemoveArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct InventoryRemoveArgs {
+    #[arg(short, long)]
+    /// The identifier used to target a specific entity
+    identifier: String,
+}
+
+impl InventoryRemoveArgs {
+    pub fn remove(&self, ctx: &mut CommandContext) -> Result<String> {
+        let user = ctx.authenticate()?;
+        ctx.db
+            .inventory_remove(&self.identifier, &ctx.config, &user)
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct InventoryEditArgs {
+    #[arg(short, long)]
+    /// The identifier used to target a specific entity
+    identifier: String,
+
+    #[arg(short, long)]
+    /// Enter your parameters according to your specified schema in a name=value way
+    set: Vec<String>,
+}
+
+impl InventoryEditArgs {
+    pub fn edit(&self, ctx: &mut CommandContext) -> Result<String> {
+        let user = ctx.authenticate()?;
+        ctx.db.inventory_edit(
+            &self.identifier,
+            &self
+                .set
+                .to_key_value_collection(&ctx.config.inventory_schema_declaration)?,
+            &ctx.config,
+            &user,
+        )
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -74,22 +137,33 @@ pub struct InventoryListArgs {
     sort: Vec<String>,
 
     #[arg(short, long)]
+    /// Executes the query directly onto the database. BEWARE that parameters must be passed seperatly with --params flags, otherwise your system will be vulnerable to SQL injection attacks
+    raw: Option<String>,
+
+    #[arg(short, long)]
+    /// Parameters that are passed with the raw SQL string
+    params: Vec<String>,
+
+    #[arg(short, long)]
     /// How the returned rows should be sorted
     condition: Vec<String>,
 }
 
-pub struct InventoryListProps {
+pub struct InventoryListProps<'a> {
     pub limit: i32,
+    pub raw: &'a Option<String>,
+    pub params: &'a Vec<String>,
 }
 
 impl InventoryListArgs {
-    pub fn list(&self, context: &CommandContext) -> Result<String> {
-        let mut user = DBUser::new();
-        auth_valid(context, &mut user)?;
+    pub fn list(&self, ctx: &CommandContext) -> Result<String> {
+        let _ = ctx.authenticate()?;
         let props = InventoryListProps {
             limit: self.limit.unwrap_or(-1),
+            raw: &self.raw,
+            params: &self.params,
         };
-        let data = context.db.inventory_list(&props, &context.config)?;
+        let data = ctx.db.inventory_list(&props, &ctx.config)?;
         return Ok(data.to_json());
     }
 }
@@ -356,40 +430,15 @@ impl SchemaRemoveArgs {
 }
 
 impl InventoryAddArgs {
-    pub fn add(&self, context: &mut CommandContext) -> Result<String> {
-        let mut user = DBUser::new();
-        auth_valid(context, &mut user)?;
-        let all_exist = self.params.iter().all(|e| match e.split_once("=") {
-            Some((name, _)) => context
-                .config
-                .inventory_schema_declaration
-                .iter()
-                .any(|e1| e1.name == name),
-            None => false,
-        });
-        if !all_exist {
-            bail!("One of the entered parameter did not match the schema");
-        }
-        let params: Vec<Result<(String, String)>> = self
+    pub fn add(&self, ctx: &mut CommandContext) -> Result<String> {
+        let user = ctx.authenticate()?;
+        let entries: KeyValueCollection = self
             .params
             .iter()
-            .map(|e| e.check_against_declaration(&context.config.inventory_schema_declaration))
-            .collect();
-        let errors = params.iter().filter(|e| e.is_err());
-        if errors.clone().count() > 0 {
-            let return_message: Vec<String> = errors
-                .map(|e| {
-                    e.as_ref()
-                        .expect_err("Is Error flag is true but element is not of error type")
-                        .to_string()
-                })
-                .collect();
-            bail!("{}", return_message.join("\n"));
-        }
-        let params: Vec<(String, String)> = params
-            .iter()
-            .map(|e| e.as_ref().unwrap().to_owned())
-            .collect();
-        return context.db.inventory_add(&params, &context.config, &user);
+            .map(|e| e.to_typed_key_value_entry(&ctx.config.inventory_schema_declaration))
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .into();
+        return ctx.db.inventory_add(&entries, &ctx.config, &user);
     }
 }

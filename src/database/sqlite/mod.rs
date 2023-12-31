@@ -1,71 +1,102 @@
 use super::{
-    AppConfig, DBOpNo, EventActionNo, IdEntry, InvManDBPool, KeyValueEntry, SchemaActionNo,
+    AppConfig, DBOpNo, EventActionNo, IdEntry, InvManDBPool, InvManToSql, KeyValueTypeEntry,
+    SchemaActionNo, SchemaCollection,
 };
 use super::{Config, Count};
 use crate::commands::{ColumnType, DBUser, InventoryListProps, SchemaDeclaration};
-use crate::database::{IdPassword, JsonEntry};
-use crate::utils::InvManDbHelper;
-use anyhow::{bail, Result};
+use crate::database::{IdPassword, KeyValueCollection};
+use crate::utils::InvManSerialization;
+use anyhow::{bail, Context, Result};
 use argon2::{
     password_hash::{rand_core::OsRng, SaltString},
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
 };
+use rusqlite::params;
 use rusqlite::types::Type;
-use rusqlite::{params, types::Value};
-use rusqlite::{Connection, Row};
+use rusqlite::{params_from_iter, Connection, Row};
+use std::iter;
 use std::path::Path;
 
 pub struct InvManSqlite {
     db: Connection,
 }
 
-impl JsonEntry {
-    fn new(row: &Row<'_>) -> Result<JsonEntry> {
-        Ok(JsonEntry {
-            json: row
-                .as_ref()
-                .column_names()
-                .iter()
-                .enumerate()
-                .map(|(i, e)| {
-                    let key = e.to_owned().into();
-                    let val_ref = row.get_ref(i)?;
-                    let value = match val_ref.data_type() {
-                        Type::Blob => {
-                            if let Some(val) = val_ref.as_blob_or_null()? {
-                                std::str::from_utf8(val).unwrap().to_string()
+trait InvManTypedKeyValue {
+    fn to_typed_key_value(&self, declarations: &SchemaCollection) -> Result<KeyValueCollection>;
+}
+
+impl InvManTypedKeyValue for Row<'_> {
+    fn to_typed_key_value(&self, declarations: &SchemaCollection) -> Result<KeyValueCollection> {
+        let items = self
+            .as_ref()
+            .column_names()
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let key = e.to_owned();
+                let val_ref = self.get_ref(i)?;
+                match key {
+                    "id" => {
+                        let value = val_ref.as_i64()?.to_string();
+                        Ok(KeyValueTypeEntry {
+                            column_type: ColumnType::INT,
+                            key: key.to_string(),
+                            value: Some(value),
+                        })
+                    }
+                    "created_at" | "updated_at" | "deleted_at" => {
+                        let value = val_ref.as_str_or_null()?;
+                        Ok(KeyValueTypeEntry {
+                            column_type: ColumnType::TEXT,
+                            key: key.to_string(),
+                            value: match value {
+                                None => None,
+                                Some(val) => Some(val.to_string()),
+                            },
+                        })
+                    }
+                    _ => {
+                        let decl = declarations.collection.iter().find(|e| e.name == key);
+                        if decl.is_none() {
+                            bail!("Declaration was not found for given key '{}'", key);
+                        }
+                        let decl = decl.unwrap();
+
+                        fn string_or_none<T>(e: Option<T>) -> Option<String>
+                        where
+                            T: ToString,
+                        {
+                            if let Some(val) = e {
+                                Some(val.to_string())
                             } else {
-                                "null".into()
+                                None
                             }
                         }
-                        Type::Integer => {
-                            if let Some(val) = val_ref.as_i64_or_null()? {
-                                val.to_string()
-                            } else {
-                                "null".into()
+
+                        let value = match val_ref.data_type() {
+                            Type::Blob => {
+                                if let Some(val) = val_ref.as_blob_or_null()? {
+                                    Some(std::str::from_utf8(val).unwrap().to_string())
+                                } else {
+                                    None
+                                }
                             }
-                        }
-                        Type::Null => "null".into(),
-                        Type::Real => {
-                            if let Some(val) = val_ref.as_f64_or_null()? {
-                                val.to_string()
-                            } else {
-                                "null".into()
-                            }
-                        }
-                        Type::Text => {
-                            if let Some(val) = val_ref.as_str_or_null()? {
-                                format!("\"{}\"", val.to_string())
-                            } else {
-                                "null".into()
-                            }
-                        }
-                    };
-                    Ok(KeyValueEntry { key, value })
-                })
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?,
-        })
+                            Type::Integer => string_or_none(val_ref.as_i64_or_null()?),
+                            Type::Real => string_or_none(val_ref.as_f64_or_null()?),
+                            Type::Text => string_or_none(val_ref.as_str_or_null()?),
+                            Type::Null => None,
+                        };
+                        Ok(KeyValueTypeEntry {
+                            column_type: decl.column_type,
+                            key: key.to_string(),
+                            value,
+                        })
+                    }
+                }
+            })
+            .into_iter()
+            .collect::<Result<Vec<KeyValueTypeEntry>>>();
+        Ok(KeyValueCollection { collection: items? })
     }
 }
 
@@ -182,8 +213,8 @@ impl InvManSqlite {
         return query;
     }
 
-    fn make_temp_inventory_table(&self, declarations: &Vec<SchemaDeclaration>) -> String {
-        let mut query = if declarations.is_empty() {
+    fn make_temp_inventory_table(&self, declarations: &SchemaCollection) -> String {
+        let mut query = if declarations.collection.is_empty() {
             return String::from(
                 r#"
 CREATE TABLE invman_temp_inventory(
@@ -205,9 +236,10 @@ CREATE TABLE invman_temp_inventory(
             )
         };
 
-        let count = declarations.iter().count();
+        let count = declarations.collection.iter().count();
         let mut i = 0;
         declarations
+            .collection
             .iter()
             .map(|e| self.make_row_statement(e))
             .for_each(|e| {
@@ -218,38 +250,29 @@ CREATE TABLE invman_temp_inventory(
                 }
             });
 
-        if !declarations.is_empty() {
+        if !declarations.collection.is_empty() {
             query.push_str(");");
         }
 
         return query;
     }
 
-    fn make_copy_columns(&self, declarations: &Vec<SchemaDeclaration>) -> String {
-        let mut cols = String::from("id,created_at,updated_at,deleted_at");
-        declarations.iter().for_each(|e| {
-            cols.push(',');
-            cols.push_str(&e.name);
-        });
-        return cols;
-    }
-
     fn alter_inventory_table(
         &mut self,
-        new_schema: &Vec<SchemaDeclaration>,
-        old_schema: &Vec<SchemaDeclaration>,
+        new_schema: &SchemaCollection,
+        old_schema: &SchemaCollection,
         action_no: &SchemaActionNo,
         user: &DBUser,
     ) -> Result<String> {
-        let old_schema_str = serde_json::to_string(old_schema)?;
-        let new_schema_str = serde_json::to_string(new_schema)?;
-        let create_inventory_table = self.make_temp_inventory_table(new_schema);
+        let old_schema_str = serde_json::to_string(&old_schema.collection)?;
+        let new_schema_str = serde_json::to_string(&new_schema.collection)?;
+        let create_inventory_table = self.make_temp_inventory_table(&new_schema);
         let copy_table = format!(
             "INSERT INTO invman_temp_inventory({cols}) SELECT {cols} FROM invman_inventory",
-            cols = self.make_copy_columns(match action_no {
-                SchemaActionNo::Alter => old_schema,
-                SchemaActionNo::Remove => new_schema,
-            })
+            cols = match action_no {
+                SchemaActionNo::Alter => old_schema.sql_names(),
+                SchemaActionNo::Remove => new_schema.sql_names(),
+            }
         );
 
         let tx = self.db.transaction()?;
@@ -295,7 +318,7 @@ impl InvManDBPool for InvManSqlite {
                 }
                 "inventory_schema_declaration" => {
                     app_config.inventory_schema_declaration =
-                        serde_json::from_str(config.value.as_str()).unwrap();
+                        SchemaCollection::new(serde_json::from_str(config.value.as_str()).unwrap());
                 }
                 _ => continue,
             }
@@ -362,16 +385,12 @@ impl InvManDBPool for InvManSqlite {
         user: &DBUser,
     ) -> Result<String> {
         let old_schema = config.inventory_schema_declaration.clone();
-        if let Some(match_decl) = config
-            .inventory_schema_declaration
-            .iter()
-            .position(|d| d.is_equal(&decl))
-        {
-            let mut schema_declaration = config.inventory_schema_declaration.clone();
-            schema_declaration.remove(match_decl);
-            config.inventory_schema_declaration = schema_declaration;
+        if let Some(idx) = config.inventory_schema_declaration.contains(&decl) {
+            let mut schema_declaration = config.inventory_schema_declaration.collection.clone();
+            schema_declaration.remove(idx);
+            config.inventory_schema_declaration.collection = schema_declaration;
         }
-        config.inventory_schema_declaration.push(decl);
+        config.inventory_schema_declaration.collection.push(decl);
         self.alter_inventory_table(
             &config.inventory_schema_declaration,
             &old_schema,
@@ -390,13 +409,14 @@ impl InvManDBPool for InvManSqlite {
         let old_schema = config.inventory_schema_declaration.clone();
         let id = config
             .inventory_schema_declaration
+            .collection
             .iter()
             .position(|e| e.name == name);
         if !id.is_some() {
             bail!("The name attribute provided did not match any schema column definition");
         }
         let id = id.unwrap();
-        config.inventory_schema_declaration.remove(id);
+        config.inventory_schema_declaration.collection.remove(id);
         self.alter_inventory_table(
             &config.inventory_schema_declaration,
             &old_schema,
@@ -408,32 +428,19 @@ impl InvManDBPool for InvManSqlite {
 
     fn inventory_add(
         &mut self,
-        params: &Vec<(String, String)>,
+        params: &KeyValueCollection,
         config: &AppConfig,
         user: &DBUser,
     ) -> Result<String> {
-        let mut names: Vec<String> = Vec::new();
-        let mut values: Vec<Value> = Vec::new();
-        params.iter().for_each(|e| {
-            names.push(e.0.clone());
-            values.push(e.1.clone().into());
-        });
-        let names = names.join(",");
-
+        let values = params.sql_values();
         let sql = format!(
             "INSERT INTO invman_inventory ({}) VALUES ({})",
-            names,
-            vec!["?"; params.iter().count()].join(",")
+            params.sql_names(),
+            vec!["?"; values.iter().count()].join(",")
         );
-        let names = config
-            .inventory_schema_declaration
-            .iter()
-            .map(|e| e.name.clone())
-            .collect::<Vec<String>>()
-            .join(",");
         let select_item_sql = format!(
             "SELECT id,created_at,updated_at,deleted_at,{} FROM invman_inventory WHERE id=?1",
-            names
+            config.inventory_schema_declaration.sql_names(),
         );
         let tx = self.db.transaction()?;
         let latest_schema = tx.query_row(
@@ -447,10 +454,17 @@ impl InvManDBPool for InvManSqlite {
         })?;
         let json = tx
             .query_row(&select_item_sql, params![latest_item.id], |row| {
-                Ok(JsonEntry::new(row))
+                Ok(row
+                    .to_typed_key_value(&config.inventory_schema_declaration)
+                    .with_context(|| {
+                        format!("Failed to convert row into typed key value representation")
+                    }))
             })??
             .to_json();
-        tx.execute("INSERT INTO invman_inventory_tx (dispatcher, schema_id, inventory_id, action_no, from_val, to_val) VALUES (?1, ?2, ?3, ?4, NULL, ?5)", params![user.id, latest_schema.id, latest_item.id, DBOpNo::Add as u32, json])?;
+        tx.execute(
+            "INSERT INTO invman_inventory_tx (dispatcher, schema_id, inventory_id, action_no, from_val, to_val) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            params![user.id, latest_schema.id, latest_item.id, DBOpNo::Add as u32, json]
+        )?;
         tx.execute("INSERT INTO invman_event_tx (action_no, dispatcher, target) VALUES (?1, ?2, (LAST_INSERT_ROWID()))", params![EventActionNo::InventoryAdd as u32, user.id])?;
         tx.commit()?;
         return Ok("Entity was successfully added to inventory".into());
@@ -460,20 +474,115 @@ impl InvManDBPool for InvManSqlite {
         &self,
         props: &InventoryListProps,
         config: &AppConfig,
-    ) -> Result<Vec<JsonEntry>> {
+    ) -> Result<Vec<KeyValueCollection>> {
         let mut sql = format!(
-            "SELECT id,created_at,updated_at,deleted_at,{} FROM invman_inventory ORDER BY id DESC",
-            config.inventory_schema_declaration.to_sql_names()
+            "SELECT id,created_at,updated_at,deleted_at,{} FROM invman_inventory",
+            config.inventory_schema_declaration.sql_names()
         );
-        if props.limit > 0 {
-            sql.push_str(" LIMIT ");
-            sql.push_str(props.limit.to_string().as_str());
+        match props.raw {
+            Some(raw) => {
+                sql.push(' ');
+                sql.push_str(raw);
+            }
+            None => {
+                if props.limit > 0 {
+                    sql.push_str(" LIMIT ");
+                    sql.push_str(props.limit.to_string().as_str());
+                }
+            }
         }
         let mut stmt = self.db.prepare(&sql)?;
-        let entries = stmt.query_map((), |row| {
-            Ok(JsonEntry::new(row)
-                .expect("Could not convert row to its Key-Value pair representation"))
+        let entries = stmt.query_map(params_from_iter(props.params), |row| {
+            Ok(row
+                .to_typed_key_value(&config.inventory_schema_declaration)
+                .with_context(|| {
+                    format!("Failed to convert SQLite result into JSON representation")
+                })
+                .unwrap())
         })?;
         return Ok(entries.map(|e| e.unwrap()).collect());
+    }
+
+    fn inventory_edit(
+        &mut self,
+        identifier: &String,
+        params: &KeyValueCollection,
+        config: &AppConfig,
+        user: &DBUser,
+    ) -> Result<String> {
+        let sql = format!(
+            "SELECT {} FROM invman_inventory WHERE id=?1",
+            config.inventory_schema_declaration.sql_names(),
+        );
+        let update_sql = format!(
+            "UPDATE invman_inventory SET {} WHERE id=?1",
+            params.sql_prepare_update_fields(1)
+        );
+        let mut sql_params = params.sql_values();
+        let mut values = vec![Some(identifier.clone())];
+        values.append(&mut sql_params);
+        let tx = self.db.transaction()?;
+        let before_item = tx.query_row(sql.as_str(), params![identifier], |row| {
+            Ok(row
+                .to_typed_key_value(&config.inventory_schema_declaration)
+                .unwrap())
+        })?;
+        tx.execute(&update_sql, params_from_iter(values.iter()))?;
+        let after_item = tx.query_row(sql.as_str(), params![identifier], |row| {
+            Ok(row
+                .to_typed_key_value(&config.inventory_schema_declaration)
+                .unwrap())
+        })?;
+        let latest_schema = tx.query_row(
+            "SELECT MAX(id) FROM invman_inventory_schema_tx",
+            (),
+            |row| Ok(IdEntry { id: row.get(0)? }),
+        )?;
+        tx.execute(
+            "INSERT INTO invman_inventory_tx (dispatcher, schema_id, inventory_id, action_no, from_val, to_val) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![user.id, latest_schema.id, before_item.get_id()?, DBOpNo::Edit as u32, before_item.to_json(), after_item.to_json()]
+        )?;
+        tx.execute("INSERT INTO invman_event_tx (action_no, dispatcher, target) VALUES (?1, ?2, (LAST_INSERT_ROWID()))", params![EventActionNo::InventoryEdit as u32, user.id])?;
+        tx.commit()?;
+        Ok("Entity was successfully edited".into())
+    }
+
+    fn inventory_remove(
+        &mut self,
+        identifier: &String,
+        config: &AppConfig,
+        user: &DBUser,
+    ) -> Result<String> {
+        let sql = format!(
+            "SELECT {} FROM invman_inventory WHERE id=?1",
+            config.inventory_schema_declaration.sql_names(),
+        );
+        let tx = self.db.transaction()?;
+        let before_item = tx.query_row(sql.as_str(), params![identifier], |row| {
+            Ok(row
+                .to_typed_key_value(&config.inventory_schema_declaration)
+                .unwrap())
+        })?;
+        tx.execute(
+            "UPDATE invman_inventory SET deleted_at=(STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')) WHERE id=?1 AND deleted_at IS NULL",
+            params![identifier],
+        )?;
+        let after_item = tx.query_row(sql.as_str(), params![identifier], |row| {
+            Ok(row
+                .to_typed_key_value(&config.inventory_schema_declaration)
+                .unwrap())
+        })?;
+        let latest_schema = tx.query_row(
+            "SELECT MAX(id) FROM invman_inventory_schema_tx",
+            (),
+            |row| Ok(IdEntry { id: row.get(0)? }),
+        )?;
+        tx.execute(
+            "INSERT INTO invman_inventory_tx (dispatcher, schema_id, inventory_id, action_no, from_val, to_val) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![user.id, latest_schema.id, before_item.get_id()?, DBOpNo::Delete as u32, before_item.to_json(), after_item.to_json()]
+        )?;
+        tx.execute("INSERT INTO invman_event_tx (action_no, dispatcher, target) VALUES (?1, ?2, (LAST_INSERT_ROWID()))", params![EventActionNo::InventoryRemove as u32, user.id])?;
+        tx.commit()?;
+        Ok("Entity was successfully removed".into())
     }
 }
