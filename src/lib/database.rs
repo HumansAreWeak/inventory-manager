@@ -21,7 +21,7 @@ mod sqlite;
 
 pub(crate) use self::sqlite::InvManSqlite;
 use crate::{
-    commands::{ColumnType, DBUser, InventoryListProps, SchemaDeclaration},
+    common::args::{ColumnType, InventoryListProps, SchemaDeclaration},
     utils::InvManSerialization,
 };
 use anyhow::{bail, Result};
@@ -123,6 +123,11 @@ struct IdPassword {
 #[derive(Debug)]
 struct IdEntry {
     id: u32,
+}
+
+#[derive(Debug)]
+struct TextEntry {
+    text: String,
 }
 
 #[derive(Debug)]
@@ -236,7 +241,7 @@ impl Into<KeyValueCollection> for Vec<KeyValueTypeEntry> {
 
 #[derive(Debug)]
 pub struct KeyValueTypeEntry {
-    key: String,
+    pub key: String,
     value: Option<String>,
     column_type: ColumnType,
 }
@@ -284,5 +289,93 @@ impl InvManSerialization for KeyValueCollection {
         });
         json.push('}');
         return json;
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DBPermissionCollection {
+    pub collection: Vec<String>,
+}
+
+impl DBPermissionCollection {
+    pub fn new(collection: Vec<String>) -> DBPermissionCollection {
+        return DBPermissionCollection { collection };
+    }
+}
+
+pub enum PermissionMode {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Default)]
+pub struct DBUser {
+    pub id: u32,
+    pub permissions: DBPermissionCollection,
+}
+
+impl DBUser {
+    fn new(id: u32, permissions: DBPermissionCollection) -> DBUser {
+        return DBUser { id, permissions };
+    }
+
+    fn can_interact_table(&self, table: &str, mode: PermissionMode) -> bool {
+        if self.permissions.collection.iter().any(|e| e == "*") {
+            return true;
+        }
+        let rule = match mode {
+            PermissionMode::Read => format!("{}.r", table),
+            PermissionMode::Write => format!("{}.w", table),
+        };
+        return self
+            .permissions
+            .collection
+            .iter()
+            .any(|e| e.eq(rule.as_str()));
+    }
+
+    fn can_interact_table_column(&self, table: &str, column: &str, mode: PermissionMode) -> bool {
+        if self.permissions.collection.iter().any(|e| e == "*") {
+            return true;
+        }
+        let rule = match mode {
+            PermissionMode::Read => format!("{}.{}.r", table, column),
+            PermissionMode::Write => format!("{}.{}.w", table, column),
+        };
+        return self
+            .permissions
+            .collection
+            .iter()
+            .any(|e| e.eq(rule.as_str()));
+    }
+
+    pub fn can_read_table(&self, table: &str) -> bool {
+        return self.can_interact_table(table, PermissionMode::Read);
+    }
+
+    pub fn can_write_table(&self, table: &str) -> bool {
+        return self.can_interact_table(table, PermissionMode::Write);
+    }
+
+    pub fn can_read_table_column(&self, table: &str, column: &str) -> bool {
+        return self.can_interact_table_column(table, column, PermissionMode::Read);
+    }
+
+    pub fn can_write_table_column(&self, table: &str, column: &str) -> bool {
+        return self.can_interact_table_column(table, column, PermissionMode::Write);
+    }
+
+    pub fn can_read_collection(&self, table: &str, collection: &KeyValueCollection) -> bool {
+        return collection
+            .collection
+            .iter()
+            .all(|e| self.can_read_table_column(table, e.key.as_str()));
+    }
+
+    pub fn can_write_collection(&self, table: &str, collection: &KeyValueCollection) -> bool {
+        return collection
+            .collection
+            .iter()
+            .all(|e| self.can_write_table_column(table, e.key.as_str()));
     }
 }

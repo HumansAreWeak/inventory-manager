@@ -18,13 +18,11 @@
  * along with invman. If not, see <https://www.gnu.org/licenses/>.
  */
 use super::{
-    AppConfig, DBOpNo, EventActionNo, IdEntry, InvManDBPool, InvManToSql, KeyValueTypeEntry,
-    SchemaActionNo, SchemaCollection,
+    AppConfig, Config, Count, DBOpNo, DBPermissionCollection, DBUser, EventActionNo, IdEntry,
+    IdPassword, InvManDBPool, InvManSerialization, InvManToSql, KeyValueCollection,
+    KeyValueTypeEntry, SchemaActionNo, SchemaCollection,
 };
-use super::{Config, Count};
-use crate::commands::{ColumnType, DBUser, InventoryListProps, SchemaDeclaration};
-use crate::database::{IdPassword, KeyValueCollection};
-use crate::utils::InvManSerialization;
+use crate::common::args::{ColumnType, InventoryListProps, SchemaDeclaration};
 use anyhow::{bail, Context, Result};
 use argon2::{
     password_hash::{rand_core::OsRng, SaltString},
@@ -146,10 +144,18 @@ impl InvManSqlite {
             "./sql/v0001/create_inventory_schema_tx_table.sql"
         ))?;
         exec(include_str!("./sql/v0001/create_event_tx_table.sql"))?;
+        exec(include_str!("./sql/v0001/create_permissions_table.sql"))?;
+        exec(include_str!(
+            "./sql/v0001/create_roles_permissions_table.sql"
+        ))?;
 
         // Inserting default values into the database
         exec(include_str!("./sql/v0001/insert_default_config.sql"))?;
         exec(include_str!("./sql/v0001/insert_default_roles.sql"))?;
+        exec(include_str!("./sql/v0001/insert_default_permissions.sql"))?;
+        exec(include_str!(
+            "./sql/v0001/insert_default_roles_permissions.sql"
+        ))?;
 
         // Creating all necessary triggers
         exec(include_str!(
@@ -393,6 +399,11 @@ impl InvManDBPool for InvManSqlite {
 
         // Store the ID of the fetched user for usage in other areas of the program
         user.id = fetched_user.id;
+        let mut stmt = self.db.prepare("SELECT p.name FROM invman_users AS u JOIN invman_roles_permissions AS up ON up.role_id = u.role_id JOIN invman_permissions AS p ON p.id = up.permission_id WHERE u.id=?1")?;
+        let rows = stmt.query_map(params![user.id], |row| {
+            Ok(row.get::<usize, String>(0)?.to_owned())
+        })?;
+        user.permissions = DBPermissionCollection::new(rows.map(|e| e.unwrap()).collect());
         return Ok(());
     }
 

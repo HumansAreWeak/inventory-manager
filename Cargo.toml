@@ -7,7 +7,14 @@ description="Manage your inventory declaratively"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "invman"
+path = "src/lib/lib.rs"
+crate-type = ["lib"]
+
+[[bin]]
+name = "invman_bin"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.75"
